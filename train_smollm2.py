@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import torch
+from accelerate import Accelerator
 from datasets import load_dataset
 from torch import nn
 from torch.optim import AdamW
@@ -21,7 +22,10 @@ CHECKPOINT_OPTIMIZERS = ("adamw", "adamq3r")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Pretrain HuggingFaceTB/SmolLM2-135M on streamed FineWeb with AdamW or AdamQ3R."
+        description=(
+            "Pretrain HuggingFaceTB/SmolLM2-135M on streamed FineWeb with "
+            "AdamW or AdamQ3R using Hugging Face Accelerate."
+        )
     )
     parser.add_argument("--model_name", default="HuggingFaceTB/SmolLM2-135M")
     parser.add_argument("--reinitialize_weights", action=argparse.BooleanOptionalAction, default=True)
@@ -38,8 +42,8 @@ def parse_args():
     parser.add_argument("--min_learning_rate_ratio", type=float, default=0.10)
     parser.add_argument("--warmup_steps", type=int, default=1_000)
     parser.add_argument("--num_steps", type=int, default=100_000)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--context_length", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save_every", type=int, default=1_000)
@@ -50,6 +54,15 @@ def parse_args():
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--adam_eps", type=float, default=1e-8)
+    parser.add_argument(
+        "--mixed_precision",
+        choices=["no", "fp16", "bf16"],
+        default="bf16",
+        help=(
+            "Accelerate mixed-precision mode. The default preserves the original "
+            "bf16 training behavior."
+        ),
+    )
     parser.add_argument(
         "--attention_implementation",
         choices=["auto", "sdpa", "flash_attention_2", "eager"],
@@ -98,6 +111,12 @@ def parse_args():
         parser.error("--min_learning_rate_ratio must be between 0.0 and 1.0.")
     if args.keep_last_checkpoints < 1:
         parser.error("--keep_last_checkpoints must be at least 1.")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient_accumulation_steps must be at least 1.")
+    if args.batch_size < 1:
+        parser.error("--batch_size must be at least 1.")
+    if args.log_every < 1:
+        parser.error("--log_every must be at least 1.")
     return args
 
 
@@ -109,7 +128,7 @@ def format_token_count(num_tokens):
             return f"{value:.2f}".rstrip("0").rstrip(".") + suffix
 
 
-def training_token_count(args, steps=None):
+def training_token_count(args, steps=None, world_size=1):
     if steps is None:
         steps = args.num_steps
     return (
@@ -117,33 +136,39 @@ def training_token_count(args, steps=None):
         * args.batch_size
         * args.gradient_accumulation_steps
         * args.context_length
+        * world_size
     )
 
 
-def build_wandb_run_name(args):
-    num_training_tokens = format_token_count(training_token_count(args))
+def build_wandb_run_name(args, world_size):
+    num_training_tokens = format_token_count(
+        training_token_count(args, world_size=world_size)
+    )
     return f"{args.model_name}_{args.optimizer}_{num_training_tokens}"
 
 
-def init_wandb(args):
+def init_trackers(args, accelerator):
     if args.no_wandb:
-        return None
+        return
 
-    import wandb
-
-    total_training_tokens = training_token_count(args)
-    run_name = build_wandb_run_name(args)
+    total_training_tokens = training_token_count(
+        args,
+        world_size=accelerator.num_processes,
+    )
+    run_name = build_wandb_run_name(args, accelerator.num_processes)
     config = {
         **vars(args),
+        "num_processes": accelerator.num_processes,
+        "distributed_type": str(accelerator.distributed_type),
         "num_training_tokens": total_training_tokens,
         "num_training_tokens_formatted": format_token_count(total_training_tokens),
         "wandb_run_name": run_name,
     }
 
-    return wandb.init(
-        project=args.wandb_project,
-        name=run_name,
+    accelerator.init_trackers(
+        project_name=args.wandb_project,
         config=config,
+        init_kwargs={"wandb": {"name": run_name}},
     )
 
 
@@ -205,12 +230,18 @@ def build_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
         model.config.use_cache = False
-    return model.to(device="cuda", dtype=torch.bfloat16)
+
+    return model
 
 
 def configure_torch_runtime(args):
-    torch.backends.cuda.matmul.allow_tf32 = True
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+
     torch.set_float32_matmul_precision(args.matmul_precision)
+
+    if not torch.cuda.is_available():
+        return
 
     if hasattr(torch.backends.cuda, "enable_flash_sdp"):
         if args.sdp_kernel == "auto":
@@ -279,7 +310,7 @@ def build_optimizer(args, model):
             "eps": args.adam_eps,
             "weight_decay": 1e-3,
         }
-        if args.adamw_impl in {"auto", "fused"}:
+        if args.adamw_impl in {"auto", "fused"} and torch.cuda.is_available():
             optimizer_kwargs["fused"] = True
         elif args.adamw_impl == "foreach":
             optimizer_kwargs["foreach"] = True
@@ -362,33 +393,74 @@ def prune_checkpoints(args, optimizer=None):
         shutil.rmtree(path)
 
 
-def save_checkpoint(model, tokenizer, optimizer, scheduler, args, step):
+def save_checkpoint(
+    accelerator,
+    model,
+    tokenizer,
+    optimizer,
+    scheduler,
+    args,
+    step,
+):
     checkpoint_dir = checkpoint_root(args) / f"step-{step}"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(checkpoint_dir)
-    tokenizer.save_pretrained(checkpoint_dir)
-    torch.save(
-        {
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "step": step,
-            "args": vars(args),
-        },
-        checkpoint_dir / "training_state.pt",
+
+    accelerator.wait_for_everyone()
+
+    unwrapped_model = accelerator.unwrap_model(
+        model,
+        keep_torch_compile=False,
     )
-    prune_checkpoints(args)
+    state_dict = accelerator.get_state_dict(model)
+    unwrapped_model.save_pretrained(
+        checkpoint_dir,
+        is_main_process=accelerator.is_main_process,
+        save_function=accelerator.save,
+        state_dict=state_dict,
+    )
+
+    if accelerator.is_main_process:
+        tokenizer.save_pretrained(checkpoint_dir)
+        accelerator.save(
+            {
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "step": step,
+                "args": vars(args),
+                "num_processes": accelerator.num_processes,
+                "distributed_type": str(accelerator.distributed_type),
+            },
+            checkpoint_dir / "training_state.pt",
+        )
+        prune_checkpoints(args)
+
+    accelerator.wait_for_everyone()
+
+
+def next_batch(dataloader, dataloader_iter):
+    try:
+        return next(dataloader_iter), dataloader_iter
+    except StopIteration:
+        dataloader_iter = iter(dataloader)
+        return next(dataloader_iter), dataloader_iter
 
 
 def main():
     args = parse_args()
+
+    accelerator = Accelerator(
+        mixed_precision=args.mixed_precision,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        log_with=None if args.no_wandb else "wandb",
+        project_dir=args.output_dir,
+    )
+
     torch.manual_seed(args.seed)
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("bf16 pretraining requires a CUDA device.")
-    if not torch.cuda.is_bf16_supported():
-        raise RuntimeError("This CUDA device does not report bf16 support.")
-
     configure_torch_runtime(args)
+
+    if accelerator.device.type != "cuda":
+        raise RuntimeError("This training script requires a CUDA device.")
+    if args.mixed_precision == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("This CUDA device does not report bf16 support.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tokenizer.pad_token is None:
@@ -412,96 +484,149 @@ def main():
 
     optimizer = build_optimizer(args, model)
     scheduler = build_scheduler(args, optimizer)
-    train_model = compile_model(args, model)
-    train_model.train()
+    model = compile_model(args, model)
 
-    ensure_checkpoint_layout(args)
-    for optimizer_name in CHECKPOINT_OPTIMIZERS:
-        prune_checkpoints(args, optimizer_name)
-    wandb_run = init_wandb(args)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model,
+        optimizer,
+        dataloader,
+        scheduler,
+    )
+    model.train()
+
+    if accelerator.is_main_process:
+        ensure_checkpoint_layout(args)
+        for optimizer_name in CHECKPOINT_OPTIMIZERS:
+            prune_checkpoints(args, optimizer_name)
+    accelerator.wait_for_everyone()
+
+    init_trackers(args, accelerator)
+
+    optimizer.zero_grad(set_to_none=True)
+    running_loss_sum = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    running_loss_count = torch.zeros((), device=accelerator.device, dtype=torch.float32)
+    completed_steps = 0
+    dataloader_iter = iter(dataloader)
+    last_log_time = time.perf_counter()
+    last_log_tokens = 0
+    real_tokens_seen_local = 0
 
     try:
-        optimizer.zero_grad(set_to_none=True)
-        running_loss = torch.zeros((), device="cuda", dtype=torch.float32)
-        completed_steps = 0
-        dataloader_iter = iter(dataloader)
-        last_log_time = time.perf_counter()
-        last_log_tokens = 0
-        real_tokens_seen = 0
-
         while completed_steps < args.num_steps:
-            for micro_step in range(args.gradient_accumulation_steps):
-                try:
-                    batch = next(dataloader_iter)
-                except StopIteration:
-                    dataloader_iter = iter(dataloader)
-                    batch = next(dataloader_iter)
+            batch, dataloader_iter = next_batch(dataloader, dataloader_iter)
 
-                input_ids = batch["input_ids"].cuda(non_blocking=True)
-                attention_mask = batch["attention_mask"].cuda(non_blocking=True)
+            with accelerator.accumulate(model):
+                input_ids = batch["input_ids"]
+                attention_mask = batch["attention_mask"]
                 labels = input_ids.masked_fill(attention_mask == 0, -100)
-                real_tokens_seen += attention_mask.sum().item()
-                batch = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "labels": labels,
-                }
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    if args.compile:
-                        mark_cudagraph_step_begin()
-                    loss = train_model(**batch).loss
-                    loss = loss / args.gradient_accumulation_steps
-                loss.backward()
-                running_loss += loss.detach().float()
+                real_tokens_seen_local += int(attention_mask.sum().item())
 
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+                if args.compile:
+                    mark_cudagraph_step_begin()
+
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                )
+                loss = outputs.loss
+
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            running_loss_sum += loss.detach().float()
+            running_loss_count += 1
+
+            if not accelerator.sync_gradients:
+                continue
+
             completed_steps += 1
 
             if completed_steps % args.log_every == 0:
-                torch.cuda.synchronize()
+                accelerator.wait_for_everyone()
+                if accelerator.device.type == "cuda":
+                    torch.cuda.synchronize(accelerator.device)
+
                 now = time.perf_counter()
-                avg_loss = (running_loss / args.log_every).item()
+                reduced_loss_sum = accelerator.reduce(
+                    running_loss_sum,
+                    reduction="sum",
+                )
+                reduced_loss_count = accelerator.reduce(
+                    running_loss_count,
+                    reduction="sum",
+                )
+                global_tokens_seen_tensor = torch.tensor(
+                    real_tokens_seen_local,
+                    device=accelerator.device,
+                    dtype=torch.long,
+                )
+                global_tokens_seen = int(
+                    accelerator.reduce(
+                        global_tokens_seen_tensor,
+                        reduction="sum",
+                    ).item()
+                )
+
+                avg_loss = (reduced_loss_sum / reduced_loss_count.clamp_min(1)).item()
                 perplexity = math.exp(avg_loss) if avg_loss < 20 else float("inf")
                 lr = scheduler.get_last_lr()[0]
-                tokens_seen = real_tokens_seen
                 elapsed = now - last_log_time
                 tokens_per_second = (
-                    (tokens_seen - last_log_tokens) / elapsed
+                    (global_tokens_seen - last_log_tokens) / elapsed
                     if elapsed > 0
                     else float("inf")
                 )
-                print(
+
+                accelerator.print(
                     f"step={completed_steps} "
                     f"loss={avg_loss:.4f} "
                     f"ppl={perplexity:.2f} "
                     f"lr={lr:.6g} "
-                    f"tok/s={tokens_per_second:.2f}",
-                    flush=True,
+                    f"tok/s={tokens_per_second:.2f}"
                 )
-                if wandb_run is not None:
-                    wandb_run.log(
+
+                if not args.no_wandb:
+                    accelerator.log(
                         {
                             "train/loss": avg_loss,
                             "train/perplexity": perplexity,
                             "train/learning_rate": lr,
-                            "train/tokens": tokens_seen,
+                            "train/tokens": global_tokens_seen,
                             "train/tokens_per_second": tokens_per_second,
                         },
                         step=completed_steps,
                     )
-                running_loss.zero_()
+
+                running_loss_sum.zero_()
+                running_loss_count.zero_()
                 last_log_time = now
-                last_log_tokens = tokens_seen
+                last_log_tokens = global_tokens_seen
 
             if args.save_every and completed_steps % args.save_every == 0:
-                save_checkpoint(model, tokenizer, optimizer, scheduler, args, completed_steps)
+                save_checkpoint(
+                    accelerator,
+                    model,
+                    tokenizer,
+                    optimizer,
+                    scheduler,
+                    args,
+                    completed_steps,
+                )
 
-        save_checkpoint(model, tokenizer, optimizer, scheduler, args, completed_steps)
+        save_checkpoint(
+            accelerator,
+            model,
+            tokenizer,
+            optimizer,
+            scheduler,
+            args,
+            completed_steps,
+        )
     finally:
-        if wandb_run is not None:
-            wandb_run.finish()
+        accelerator.end_training()
 
 
 if __name__ == "__main__":
